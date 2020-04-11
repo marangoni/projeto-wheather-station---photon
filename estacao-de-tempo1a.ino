@@ -1,87 +1,88 @@
-// Estacao de tempo v1
+/// Estacao de tempo v1
 // Medição de temperatura e umidade com o DHT22
-// Versão 1.01 - 08102019
-// - Limpeza do código
-// - Redução dos intervalos de envio de informações
-// - Retirei os delays
+// Versão 1.03 - 10042020
+// Enviará todas as informacoes para o thingspeak - nao fará limpeza dos dados
+// Fluxo do programa: Desperta -> Sincroniza relógio -> Mede -> Verifica se
+// 										medida esta ok -> Se Sim publica -> Dorme
 
 #include "Adafruit_DHT_Particle.h"
 
-#define DHTPIN D2     // what pin we're connected to
+#define DHTPIN D2     // Saída do DHT -> pino D2
 
-//sincronização do tempo
+#define TEMPO_ECONOMIA_ENERGIA_MILLIS (12 * 60 * 1000)
 #define ONE_DAY_MILLIS (24 * 60 * 60 * 1000)
-#define TEMPO_ENTRE_MEDIDAS_MILLIS (2 * 60 * 1000)
-#define TEMPO_ECONOMIA_ENERGIA_MILLIS (5 * 60 * 1000)
 
 unsigned long lastSync = millis();
-unsigned long lastMed = millis();
-unsigned long lastSLEEP = millis();
-unsigned long lastdelay = millis();
-
 
 #define DHTTYPE DHT22		// DHT 22 (AM2302)
 
 DHT dht(DHTPIN, DHTTYPE);
 int loopCount;
-float last_t =0;
-float last_h =0;
 
+// ThingSpeak
+// Ref: https://community.particle.io/t/how-to-set-up-a-json-for-multiple-variables-in-a-webhook-integration/33172/4
+// Deve casar com o nome do evento utilizado no webhook
+const char * eventName = "weather";
+// Informacao do canal - ThingSpeak
+unsigned long myChannelNumber =1034429; //HomeAlone2
+const char * myWriteAPIKey = "97I0Q70ITCMGMQ6U";
 
 void setup() {
 	Particle.publish("state", "DHT22 inicio medidas");
 	dht.begin();
+	//sincroniza horário com a nuvem a cada nova medida
+	if (Particle.connected())                     //Only time sync when in connected operation mode and Cloud connected
+	    {
+	        time_t lastSyncTimestamp;
+	        unsigned long lastSync = Particle.timeSyncedLast(lastSyncTimestamp);
+	        if (millis() - lastSync >= ONE_DAY_MILLIS)                              //More than one day since last time sync
+	        {
+	            unsigned long cur = millis();
+	            Particle.syncTime();                                                //Request time synchronization from Particle Device Cloud
+	            waitUntil(Particle.syncTimeDone);                                   //Wait until Photon receives time from Particle Device Cloud (or connection to Particle Device Cloud is lost)
+	            Particle.publish("state", "Relógio sincronizado!");
+	        }
+	    }
 }
 
 void loop() {
-  //Momento de sincronizar o relógio?
-  if (millis() - lastSync > ONE_DAY_MILLIS) {
-    // Request time synchronization from the Particle Cloud
-    Particle.syncTime(); //sincroniza horário com a nuvem a cada 24h
-    lastSync = millis();
-  }
 
-  // Momento de medir?
-  //if (millis() - lastMed > TEMPO_ENTRE_MEDIDAS_MILLIS) { 
-      
+  // Realiza as medidas e obtem "timestamp" e a hora da medida
 	float h = dht.getHumidity();
-   	float t = dht.getTempCelcius();
-	
-    Time.zone(-3);
-    String hora =Time.format(Time.now(), "%H:%M");
-    String timeStamp = Time.timeStr();
-	
-	
-    // Check if any reads failed and exit early (to try again).
-	// if (isnan(h) || isnan(t) || isnan(f)) {
-	if (isnan(h)) {
+  float t = dht.getTempCelcius();
+	Time.zone(-3);
+  String hora =Time.format(Time.now(), "%H:%M");
+  String timeStamp = Time.timeStr();
+
+	// Verifica se houve falha na medida - se h=0 ou t=0 -> houve erro
+	// Se houve erro publica mensagem na serial e na nuvem
+	if (isnan(h) || isnan(t)) {
 		Serial.println("Falha na leitura do sensor!");
-	    h=t=0;
+	  Particle.publish("state", "Falha na leitura do sensor!");
 	}
-	
-	if (t==0 || h==0) 	{//Se houve erro na leitura, manter valor anterior
-	    t = last_t;
-	    h = last_h;
-	} 
-	    else // se leitura ok, atualizar valor
-	{
-	    last_t = t;
-	    last_h = h;
-	}
-	
-	String Data="{\"Value1\":\""+String(t,2)+"\","; //Temp
-	Data+="\"Value2\":\""+String(h,2)+"\","; //Humdity
-	Data+="\"Value3\":\""+String(timeStamp)+"\","; //data da medicao
-	Data+="\"Value4\":\""+String(hora)+"\"}"; //hora
+	else
+	{//Se ocorreu a leitura - segue o programa
 
-	if (t!=0 || h!=0 ){ //somente publica se o valor não for zero
-	    Particle.publish("WeatherData", Data, PUBLIC);	//publica na nuvem
-	    Particle.publish("state", "nova_medida");
-	//lastMed = millis(); //Atualiza timer medidas
+		// Cria o JSON para envio
+		String Data="{\"Data_med\":\""+String(timeStamp)+"\","; //timestamp
+	  Data+="\"temperatura\":\""+String(t,2)+"\","; 				 //Temperatura
+		Data+="\"umidade\":\""+String(h,2)+"\",";         		//Umidade
+	  Data+="\"key\":\""+String(myWriteAPIKey)+"\"}";				//api_key thingspeak
+
+		//Publicação na nuvem do JSON
+		Particle.publish("state", "Nova_medida");
+		Particle.publish(eventName, Data, PUBLIC);
 	}
-	delay(2000);
-	Particle.publish("state", "Economia de energia por 5 minutos");
-    System.sleep(SLEEP_MODE_DEEP, TEMPO_ECONOMIA_ENERGIA_MILLIS/1000);
-	
+
+  //delay enquanto para facilitar o debug
+  RGB.control(true);
+  RGB.color(255, 255, 255);
+  RGB.brightness(64);
+  Particle.publish("state", "Aguardando 15s nova gravacao");
+  delay(15000);
+  RGB.control(false);
+  //Entra no modo de economia de energia 5 min
+  Particle.publish("state", "Economia de energia por 12 minutos");
+  System.sleep(SLEEP_MODE_DEEP, TEMPO_ECONOMIA_ENERGIA_MILLIS/1000);
+
 }
-
